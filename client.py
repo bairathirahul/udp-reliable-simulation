@@ -130,7 +130,7 @@ class GBN(SimulationClient):
                 # All packets are sent and acknowledgements are received
                 if self.num_packets == 0 and self.send_base == self.next_seq_num - 1:
                     self.completed = True
-            except:
+            except ValueError:
                 pass
             
             # Release the lock so that send_thread can work
@@ -195,8 +195,7 @@ class GBN(SimulationClient):
 class SR(SimulationClient):
     def __init__(self, socket, num_bits, window_size, timeout, mss, data_file, server_addr, logger):
         super().__init__(socket, num_bits, window_size, timeout, mss, data_file, server_addr, logger)
-        # Maximum index in current window till acknowledgments are received
-        self.max_ack_received = -1
+        self.ack_received = []
     
     def receive(self):
         while not self.completed:
@@ -211,23 +210,29 @@ class SR(SimulationClient):
             
             try:
                 index = self.sequence_numbers.index(ack_num)
-                self.max_ack_received = max(self.max_ack_received, index)
-                
                 # Set sent time to infinity to prevent timeout
                 self.sent_times[index] = math.inf
+                # Set acknowledgement received to True
+                self.ack_received[index] = True
+                
                 # Move the window forward
                 if index == 0:
-                    for i in range(self.max_ack_received):
+                    try:
+                        false_index = self.ack_received.index(False)
+                    except ValueError:
+                        false_index = self.window_size - 1
+                
+                    for i in range(false_index):
                         self.packets_buffer.pop(0)
                         self.sent_times.pop(0)
                         self.sequence_numbers.pop(0)
                         self.send_base += 1
-                    self.max_ack_received = -1
+                        self.ack_received.pop(0)
                     
                     # All packets are sent and acknowledgements are received
                     if self.num_packets == 0 and self.send_base == self.next_seq_num - 1:
                         self.completed = True
-            except:
+            except ValueError:
                 pass
             
             # Release the lock so that send_thread can work
@@ -272,6 +277,7 @@ class SR(SimulationClient):
                 # Add packet to the buffer
                 self.packets_buffer.append(packet)
                 self.sequence_numbers.append(seq_num)
+                self.ack_received.append(False)
     
                 # Corrupt packet based on the probability
                 if random.random() <= self.packet_corrupt_probability:

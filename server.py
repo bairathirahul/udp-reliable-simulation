@@ -93,30 +93,32 @@ class SR(SimulationServer):
         super().__init__(server_socket, num_bits, window_size, logger)
         
         self.receiver_buffer = [None] * self.window_size
-        self.base_seq_num = -1
+        self.sequence_numbers = list(range(0, self.window_size))
     
     def process(self, packet, client_addr):
         seq_num = packet[0]
         
-        if self.base_seq_num == -1:
-            self.receiver_buffer[0] = packet
-            self.base_seq_num = packet[0]
-        
-        index = self.sequence_numbers.index(seq_num)
-        self.receiver_buffer[index] = packet
-        if index == 0:
-            try:
-                first_none = self.receiver_buffer.index(None)
-            except:
-                first_none
-            i = first_none
-            self.sequence_numbers = self.sequence_numbers[first_none:] + self.sequence_numbers[:first_none]
-            while i < self.window_size:
-                self.receiver_buffer[i - first_none] = self.receiver_buffer[i]
-                i += 1
-                
+        if seq_num in self.sequence_numbers:
+            index = self.sequence_numbers.index(seq_num)
+            self.receiver_buffer[index] = packet
+            
+            if index == 0:
+                try:
+                    # Move the window forward until first None
+                    first_none = self.receiver_buffer.index(None)
+                    self.sequence_numbers = [(num + first_none) % self.max_seq_num for num in self.sequence_numbers]
+                    i = first_none
+                    while i < self.window_size:
+                        self.receiver_buffer[i - first_none] = self.receiver_buffer[i]
+                        self.receiver_buffer[i] = None
+                        i += 1
+                except ValueError:
+                    # Clear the buffer if all packets in the window are available
+                    self.sequence_numbers = [(num + self.window_size - 1) % self.max_seq_num for num in self.sequence_numbers]
+                    for i in range(self.window_size):
+                        self.receiver_buffer[i] = None
         self.send_ack(seq_num, client_addr)
-
+        
 
 def main():
     logger = logging.getLogger(__name__)
