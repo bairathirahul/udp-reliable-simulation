@@ -1,121 +1,171 @@
-import sys
+import logging
 import random
 import socket
-from struct import *
+import sys
+import time
+import struct
+import ctypes
 
-## Calculating the checksum
-def CalculateChecksum(cs):
-	if len(cs) % 2 != 0:
-		cs  = cs + str(0)
-	iterator = 0
-	checksum = 0
-	while iterator < len(cs):
-		cs1 = ord(cs[iterator])*128 + ord(cs[iterator+1])
-		cs2 = 32767 - cs1
-		cs3 = checksum + cs2
-		checksum = (cs3 % 32768) + (cs3 / 32768)
-		iterator += 2
-	return (32767 - checksum)
+from abc import ABC
+from abc import abstractmethod
 
-## Verify checksum of the packet received
-def Checksum(cs, seq, header, data):
-	checksum = pack('IH'+str(len(data))+'s', seq, header, data)
-	if CalculateChecksum(checksum) == cs:
-		return True
-	else:
-		return False
+from checksum import Checksum
 
-## Send acknowledgement
-def SendAck(seqNum, clientAddr, sock):
-	allZeros = int('0000000000000000', 2)
-	header = int('1010101010101010', 2)
-	packet = pack('IHH', seqNum, allZeros, header)
-	sock.sendto(packet, clientAddr)
+
+class SimulationServer(ABC):
+    def __init__(self, server_socket, num_bits, window_size, logger):
+        """
+        Initialize the protocol
+        :param server_socket: Server server_socket
+        """
+        self.server_socket = server_socket
+        self.max_seq_num = 2 ** (num_bits - 1)
+        self.window_size = window_size
+        self.logger = logger
+        
+        self.packet_drop_probability = 0.1
+        self.packet_corrupt_probability = 0.1
+        
+        self.header = int('1010101010101010', 2)
+    
+    def send_ack(self, seq_num, client_addr):
+        # Prepare Acknowledgement
+        packet = struct.pack('IH', seq_num, self.header)
+        # Calculate checksum
+        checksum = Checksum.calculate(packet)
+        
+        # Add Checksum to the packet
+        packet = ctypes.create_string_buffer(8)
+        struct.pack_into('IHH', packet, 0, seq_num, checksum, self.header)
+
+        # Corrupt packet based on the probability
+        if random.random() <= self.packet_corrupt_probability:
+            packet[random.randint(0, len(packet) - 1)] = 0
+        
+        # Send ACK
+        time.sleep(1)
+        self.server_socket.sendto(packet, client_addr)
+        self.logger.info('Sequence Number %d - Acknowledgement Sent', seq_num)
+    
+    def execute(self):
+        # Read packets and process
+        while True:
+            message, client_addr = self.server_socket.recvfrom(5000)
+            
+            packet = struct.unpack('IHH' + str(len(message) - 8) + 's', message)
+            
+            # Drop packet
+            if random.random() <= self.packet_drop_probability:
+                self.logger.info('Sequence Number %d - Packet Dropped', packet[0])
+                continue
+            
+            self.logger.info('Sequence Number %d - Packet Received', packet[0])
+            
+            # Verify packet checksum
+            if not Checksum.verify(message):
+                self.logger.info('Sequence Number %d - Packet is Corrupt', packet[0])
+                continue
+            
+            self.process(packet, client_addr)
+    
+    @abstractmethod
+    def process(self, packet, client_addr):
+        pass
+
+
+class GBN(SimulationServer):
+    def __init__(self, server_socket, window_size, logger):
+        super().__init__(server_socket, window_size, logger)
+        self.expected_seq_num = 0
+        
+    def process(self, packet, client_addr):
+        seq_num = packet[0]
+        
+        if seq_num == self.expected_seq_num:
+            self.expected_seq_num = (self.expected_seq_num + 1) % self.max_seq_num
+        else:
+            self.logger.info('Sequence Number %d - Out of order, discarded', seq_num)
+        self.send_ack(self.expected_seq_num, client_addr)
+
+
+class SR(SimulationServer):
+    def __init__(self, server_socket, num_bits, window_size, logger):
+        super().__init__(server_socket, num_bits, window_size, logger)
+        
+        self.receiver_buffer = [None] * self.window_size
+        self.sequence_numbers = range(0, self.window_size)
+        self.receive_base = -1
+    
+    def process(self, packet, client_addr):
+        seq_num = packet[0]
+        
+        index = self.sequence_numbers.index(seq_num)
+        self.receiver_buffer[index] = packet
+        if index == 0:
+            first_none = self.receiver_buffer.index(None)
+            i = first_none
+            self.sequence_numbers = self.sequence_numbers[first_none:] + self.sequence_numbers[:first_none]
+            while i < self.window_size:
+                self.receiver_buffer[i - first_none] = self.receiver_buffer[i]
+                
+        self.send_ack(seq_num, client_addr)
 
 def main():
-	port = int(sys.argv[1])
-	host = '127.0.0.1'
-	protocol = sys.argv[2]
-	windowSize = 0
-	print ("========== Receiver info ===========")
-	print ("Hostname: " + host)
-	print ("Port: " + str(port))
-	print ("Protocol: " + protocol)
-	if protocol == 'SR':
-		windowSize = int(sys.argv[3])
-		print ("Window size: " + str(windowSize))
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(logging.StreamHandler(sys.stdout))
 
+    if len(sys.argv) < 2:
+        logger.error('Please provide an input file')
+        sys.exit(1)
 
+    if len(sys.argv) < 3:
+        logger.error('Please provide a port number')
+        sys.exit(1)
 
-	serverSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	serverSocket.bind((host, port))
+    try:
+        file_contents = open(sys.argv[1], 'r')
+    except IOError:
+        logger.error('File %s does not exist', sys.argv[1])
+        sys.exit(1)
 
-	seqNum = 0
-	firstInWindow = 0
-	lastInWindow = firstInWindow + windowSize - 1
-	prob = 0.1
-	lastReceived = -1
-	received = []
-	receiveBuffer = []
-	for i in range(windowSize):
-		received.append(0)
-		receiveBuffer.append(None)
+    protocol = file_contents.readline().strip()  # Protocol to be used
+    num_bits, window_size = file_contents.readline().strip().split(' ')  # Window size
+    num_bits = int(num_bits)
+    window_size = int(window_size)
+    
+    # server_socket parameters
+    port = int(sys.argv[2])
+    host = socket.gethostbyname('localhost')
+    
+    print("---------------- Receiver info ----------------")
+    print("Hostname: " + host)
+    print("Port: " + str(port))
+    print("Protocol: " + protocol)
+    print("Window Size: " + str(window_size))
+    print("-----------------------------------------------")
+    
+    # Invalid protocol, throw error
+    if not protocol == 'SR' and not protocol == 'GBN':
+        logger.error('Protocol %s is invalid. Must be SR (Selective Repeat) or GBN (Go-Back N)', protocol)
+        sys.exit(1)
+    
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        server_socket.bind((host, port))
+        
+        # Initialize the protocol implementation
+        if protocol == 'SR':
+            protocol = SR(server_socket, num_bits, window_size, logger)
+        elif protocol == 'GBN':
+            protocol = GBN(server_socket, num_bits, window_size, logger)
+        
+        protocol.execute()
+    except KeyboardInterrupt:
+        logging.info('Server shutting down')
+        server_socket.close()
+        sys.exit(0)
 
-	while True:
-		message, addr = serverSocket.recvfrom(1024)
-		packet = unpack('IHH'+str(len(message) - 8)+'s', message)
-
-		# When the last packet is received, close the server
-		if packet[2] == int('1111111111111111', 2):
-			break
-
-		if prob < random.random():
-			seqNum = packet[0]
-			checksum = packet[1]
-			header = packet[2]
-			data = packet[3]
-			print ("Packet received for S" + str(seqNum))
-
-			# Protocol = Go back N
-			if protocol == "GBN":
-				if Checksum(checksum, seqNum, header, data):
-					if seqNum == lastReceived + 1:
-						print ("ACK sent for S" + str(seqNum))
-						SendAck(seqNum, addr, serverSocket)
-						lastReceived = seqNum
-					elif seqNum != lastReceived + 1 and seqNum > lastReceived + 1:
-						if lastReceived >= 0:
-							print ("(Packet out of order, to be discarded): last received packet in sequence: packet " \
-								  + str(lastReceived))
-					else:
-						print ("ACK sent for S" + str(seqNum))
-						SendAck(seqNum, addr, serverSocket)
-						lastReceived = seqNum
-				else:
-					print ("Packet is discarded, Checksum not matching.")
-
-			# Protocol = Selective repeat
-			elif protocol == "SR":
-				if seqNum < firstInWindow:
-					print ("Old packet received: S" + str(seqNum))
-					SendAck(seqNum, addr, serverSocket)
-				else:
-					if Checksum(checksum, seqNum, header, data):
-						if seqNum >= firstInWindow and seqNum <= lastInWindow:
-							if seqNum == firstInWindow:
-								receiveBuffer[firstInWindow % windowSize] = None
-								received[firstInWindow % windowSize] = 0
-								firstInWindow += 1
-								lastInWindow += 1
-							elif received[seqNum % windowSize] == 0:
-								receiveBuffer[seqNum % windowSize] = packet
-								received[seqNum % windowSize] = 1
-						print ("ACK sent for S" + str(seqNum))
-						SendAck(seqNum, addr, serverSocket)
-					else:
-						print ("Packet is discarded, Checksum not matching.")
-		else:
-			print ("Packet S" + str(packet[0]) + " lost.")
 
 if __name__ == '__main__':
-	main()
+    main()
