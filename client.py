@@ -1,23 +1,25 @@
+import ctypes
+import logging
+import math
 import random
 import socket
-import sys
-import logging
-import time
-import ctypes
 import struct
-
-from threading import Lock
-from threading import Thread
-from checksum import Checksum
+import sys
+import time
+import string
 from abc import ABC
 from abc import abstractmethod
 from copy import deepcopy
+from threading import Lock
+from threading import Thread
+from checksum import Checksum
 
 
 class SimulationClient(ABC):
-    def __init__(self, socket, window_size, timeout, mss, num_packets, server_addr, logger):
+    def __init__(self, socket, num_bits, window_size, timeout, mss, num_packets, server_addr, logger):
         self.socket = socket
         self.window_size = window_size
+        self.max_seq_num = 2 ** num_bits
         self.timeout = timeout
         self.num_packets = num_packets
         self.mss = mss
@@ -35,7 +37,7 @@ class SimulationClient(ABC):
         self.header = int('0101010101010101', 2)
         self.completed = False
         self.lock = Lock()
-            
+    
     def get_next_packet(self, seq_num):
         if self.num_packets == 0:
             return None
@@ -43,7 +45,7 @@ class SimulationClient(ABC):
         self.num_packets -= 1
         
         # Create packet
-        data = 'Simulation with UDP.'.encode('ascii')
+        data = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(self.mss - 8)).encode('ascii')
         length = len(data)
         
         # Create packet
@@ -52,7 +54,7 @@ class SimulationClient(ABC):
         checksum = Checksum.calculate(packet)
         
         # Add Checksum to the packet
-        packet = ctypes.create_string_buffer(length + 8)
+        packet = ctypes.create_string_buffer(self.mss)
         struct.pack_into('IHH' + str(length) + 's', packet, 0, seq_num, checksum, self.header, data)
         
         return packet
@@ -60,12 +62,12 @@ class SimulationClient(ABC):
     def get_next_ack(self):
         message = self.socket.recv(self.mss)
         packet = struct.unpack('IHH', message)
-    
+        
         # Drop ack based on probability
         if random.random() <= self.packet_drop_probability:
             self.logger.info('Acknowledgement Number %d - Acknowledgement Dropped', packet[0])
             return False
-
+        
         self.logger.info('Acknowledgement Number %d - Acknowledgement Received', packet[0])
         
         # Packet corrupted, ignore
@@ -92,7 +94,7 @@ class SimulationClient(ABC):
         receive_thread.start()
         send_thread.join()
         receive_thread.join()
-        
+    
     @abstractmethod
     def receive(self):
         pass
@@ -100,7 +102,7 @@ class SimulationClient(ABC):
     @abstractmethod
     def send(self):
         pass
-    
+
 
 class GBN(SimulationClient):
     def receive(self):
@@ -108,7 +110,7 @@ class GBN(SimulationClient):
             ack = self.get_next_ack()
             if not ack:
                 continue
-                
+            
             ack_num = ack[0] - 1
             if ack_num == -1:
                 ack_num = self.window_size - 1
@@ -123,8 +125,9 @@ class GBN(SimulationClient):
                     self.packets_buffer.pop(0)
                     self.sent_times.pop(0)
                     self.sequence_numbers.pop(0)
-                self.send_base += index
+                    self.send_base += 1
                 
+                # All packets are sent and acknowledgements are received
                 if self.num_packets == 0 and self.send_base == self.next_seq_num - 1:
                     self.completed = True
             except:
@@ -132,7 +135,7 @@ class GBN(SimulationClient):
             
             # Release the lock so that send_thread can work
             self.lock.release()
-
+    
     def send(self):
         while not self.completed:
             self.lock.acquire()
@@ -157,11 +160,10 @@ class GBN(SimulationClient):
                     
                     # Update the timer
                     self.sent_times[i] = time.time()
-                    
+            
             elif self.next_seq_num - self.send_base < self.window_size:
-                
                 # Get next packet
-                seq_num = self.next_seq_num % self.window_size
+                seq_num = self.next_seq_num % self.max_seq_num
                 packet = self.get_next_packet(seq_num)
                 
                 # All the data has been transmitted
@@ -172,7 +174,78 @@ class GBN(SimulationClient):
                 # Add packet to the buffer
                 self.packets_buffer.append(packet)
                 self.sequence_numbers.append(seq_num)
+                
+                # Corrupt packet based on the probability
+                if random.random() <= self.packet_corrupt_probability:
+                    packet = deepcopy(packet)
+                    packet[random.randint(0, len(packet) - 1)] = 0
+                
+                # Send the packet
+                time.sleep(0.5)
+                self.socket.sendto(packet, self.server_addr)
+                self.logger.info('Sequence Number %d - Packet Sent', seq_num)
+                
+                # Update the timer
+                self.sent_times.append(time.time())
+                self.next_seq_num = self.next_seq_num + 1
+            
+            self.lock.release()
 
+
+class SR(SimulationClient):
+    def __init__(self, socket, num_bits, window_size, timeout, mss, data_file, server_addr, logger):
+        super().__init__(socket, num_bits, window_size, timeout, mss, data_file, server_addr, logger)
+        # Maximum index in current window till acknowledgments are received
+        self.max_ack_received = -1
+    
+    def receive(self):
+        while not self.completed:
+            ack = self.get_next_ack()
+            if not ack:
+                continue
+                
+            ack_num = ack[0]
+            
+            # Acquire processing lock
+            self.lock.acquire()
+            
+            try:
+                index = self.sequence_numbers.index(ack_num)
+                self.max_ack_received = max(self.max_ack_received, index)
+                
+                # Set sent time to infinity to prevent timeout
+                self.sent_times[index] = math.inf
+                # Move the window forward
+                if index == 0:
+                    for i in range(self.max_ack_received):
+                        self.packets_buffer.pop(0)
+                        self.sent_times.pop(0)
+                        self.sequence_numbers.pop(0)
+                        self.send_base += 1
+                    self.max_ack_received = -1
+                    
+                    # All packets are sent and acknowledgements are received
+                    if self.num_packets == 0 and self.send_base == self.next_seq_num - 1:
+                        self.completed = True
+            except:
+                pass
+            
+            # Release the lock so that send_thread can work
+            self.lock.release()
+    
+    def send(self):
+        while not self.completed:
+            self.lock.acquire()
+            
+            timeout_index = self.is_timeout()
+            if timeout_index is not None:
+                seq_num = self.sequence_numbers[timeout_index]
+                self.logger.info('Sequence Number %d - Timeout Occurred', seq_num)
+                i = timeout_index
+                
+                packet = self.packets_buffer[i]
+                seq_num = self.sequence_numbers[i]
+                
                 # Corrupt packet based on the probability
                 if random.random() <= self.packet_corrupt_probability:
                     packet = deepcopy(packet)
@@ -184,101 +257,40 @@ class GBN(SimulationClient):
                 self.logger.info('Sequence Number %d - Packet Sent', seq_num)
                 
                 # Update the timer
-                self.sent_times.append(time.time())
-                self.next_seq_num = self.next_seq_num + 1
-                
-            self.lock.release()
-
-
-class SR(SimulationClient):
-    def __init__(self, socket, window_size, timeout, mss, data_file, server_addr, logger):
-        super().__init__(socket, window_size, timeout, mss, data_file, server_addr, logger)
-        # List to keep track of received acknowledgements
-        self.ack_received = []
-        
-    def receive(self):
-        while not self.completed:
-            ack = self.get_next_ack()
-            ack_num = ack[0]
+                self.sent_times[i] = time.time()
             
-            # Acquire processing lock
-            self.lock.acquire()
-            
-            if self.send_base <= ack_num < self.next_seq_num:
-                self.ack_received[ack_num - self.send_base] = True
-                if ack_num == self.send_base:
-                    i = 0
-                    while self.ack_received[i]:
-                        self.packets_buffer.pop(0)
-                        self.sent_times.pop(0)
-                        i += 1
-                    
-                    for j in range(i):
-                        self.ack_received.pop(0)
-                
-                self.send_base = ack_num + 1
-                
-                if self.send_base == self.next_seq_num:
-                    self.completed = True
-            
-            # Release the lock so that send_thread can work
-            self.lock.release()
-    
-    def send(self):
-        while not self.completed:
-            self.lock.acquire()
-            
-            timeout_index = self.is_timeout()
-            if timeout_index is not None:
-                self.logger.info('Sequence Number %d - Timeout Occurred', self.send_base + timeout_index)
-                
-                i = self.send_base + timeout_index
-                packet = self.packets_buffer[i]
-
-                # Corrupt packet based on the probability
-                if random.random() <= self.packet_corrupt_probability:
-                    packet = deepcopy(packet)
-                    packet[random.randint(0, len(packet) - 1)] = 0
-
-                # Send the packet
-                self.socket.sendto(packet, self.server_addr)
-                self.logger.info('Sequence Number %d - Packet Sent', i)
-
-                # Update the timer
-                self.sent_times[i - self.send_base] = (seq_num, time.time())
-                
             elif self.next_seq_num - self.send_base < self.window_size:
                 # Get next packet
-                seq_num = self.next_seq_num % self.window_size
+                seq_num = self.next_seq_num % self.max_seq_num
                 packet = self.get_next_packet(seq_num)
-                
+    
                 # All the data has been transmitted
                 if packet is None:
+                    self.lock.release()
                     continue
-                
+    
                 # Add packet to the buffer
                 self.packets_buffer.append(packet)
-                
-                # Add acknowledgement buffer entry
-                self.ack_received.append(False)
-                
+                self.sequence_numbers.append(seq_num)
+    
                 # Corrupt packet based on the probability
                 if random.random() <= self.packet_corrupt_probability:
                     packet = deepcopy(packet)
                     packet[random.randint(0, len(packet) - 1)] = 0
-                
+    
                 # Send the packet
+                time.sleep(0.5)
                 self.socket.sendto(packet, self.server_addr)
-                self.logger.info('Sequence Number %d - Packet Sent', self.next_seq_num)
-                
+                self.logger.info('Sequence Number %d - Packet Sent', seq_num)
+    
                 # Update the timer
-                self.sent_times.append((seq_num, time.time()))
-                self.next_seq_num += 1
+                self.sent_times.append(time.time())
+                self.next_seq_num = self.next_seq_num + 1
             
             self.lock.release()
-                
 
-def main() :
+
+def main():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
     logger.addHandler(logging.StreamHandler(sys.stdout))
@@ -286,24 +298,26 @@ def main() :
     if len(sys.argv) < 2:
         logger.error('Please provide an input file')
         sys.exit(1)
-        
+    
     if len(sys.argv) < 3:
         logger.error('Please provide a port number')
         sys.exit(1)
-        
+    
     if len(sys.argv) < 4:
         logger.error('Please provide number of packets to send')
         sys.exit(1)
-        
+    
     try:
         file_contents = open(sys.argv[1], 'r')
     except IOError:
         logger.error('File %s does not exist', sys.argv[1])
         sys.exit(1)
-        
+    
     protocol = file_contents.readline().strip()  # Protocol to be used
-    window_size = int(file_contents.readline().strip())  # Window size
-    timeout = int(file_contents.readline().strip())  # Timeout in seconds
+    num_bits, window_size = file_contents.readline().strip().split(' ')
+    num_bits = int(num_bits)  # Number Bits
+    window_size = int(window_size)  # Window Size
+    timeout = int(file_contents.readline().strip())  // 1000 # Timeout in seconds
     mss = int(file_contents.readline().strip())  # Maximum segment size
     port = int(sys.argv[2])  # Port to be used
     host = socket.gethostbyname('localhost')
@@ -321,16 +335,16 @@ def main() :
     if not protocol == 'SR' and not protocol == 'GBN':
         logger.error('Protocol %s is invalid. Must be SR (Selective Repeat) or GBN (Go-Back N)', protocol)
         sys.exit(1)
-
+    
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server_addr = (host, port)
     
     # Initialize the protocol implementation
     if protocol == 'SR':
-        protocol = SR(client_socket, window_size, timeout, mss, num_packets, server_addr, logger)
+        protocol = SR(client_socket, num_bits, window_size, timeout, mss, num_packets, server_addr, logger)
     elif protocol == 'GBN':
-        protocol = GBN(client_socket, window_size, timeout, mss, num_packets, server_addr, logger)
-        
+        protocol = GBN(client_socket, num_bits, window_size, timeout, mss, num_packets, server_addr, logger)
+    
     protocol.execute()
 
 

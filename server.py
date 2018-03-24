@@ -74,8 +74,8 @@ class SimulationServer(ABC):
 
 
 class GBN(SimulationServer):
-    def __init__(self, server_socket, window_size, logger):
-        super().__init__(server_socket, window_size, logger)
+    def __init__(self, server_socket, num_bits, window_size, logger):
+        super().__init__(server_socket, num_bits, window_size, logger)
         self.expected_seq_num = 0
         
     def process(self, packet, client_addr):
@@ -93,22 +93,30 @@ class SR(SimulationServer):
         super().__init__(server_socket, num_bits, window_size, logger)
         
         self.receiver_buffer = [None] * self.window_size
-        self.sequence_numbers = range(0, self.window_size)
-        self.receive_base = -1
+        self.base_seq_num = -1
     
     def process(self, packet, client_addr):
         seq_num = packet[0]
         
+        if self.base_seq_num == -1:
+            self.receiver_buffer[0] = packet
+            self.base_seq_num = packet[0]
+        
         index = self.sequence_numbers.index(seq_num)
         self.receiver_buffer[index] = packet
         if index == 0:
-            first_none = self.receiver_buffer.index(None)
+            try:
+                first_none = self.receiver_buffer.index(None)
+            except:
+                first_none
             i = first_none
             self.sequence_numbers = self.sequence_numbers[first_none:] + self.sequence_numbers[:first_none]
             while i < self.window_size:
                 self.receiver_buffer[i - first_none] = self.receiver_buffer[i]
+                i += 1
                 
         self.send_ack(seq_num, client_addr)
+
 
 def main():
     logger = logging.getLogger(__name__)
