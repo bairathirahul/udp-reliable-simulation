@@ -351,7 +351,11 @@ def main():
     elif protocol == 'GBN':
         protocol = GBN(client_socket, num_bits, window_size, timeout, mss, num_packets, server_addr, logger)
     
-    protocol.execute()
+    try:
+        protocol.execute()
+    except KeyboardInterrupt:
+        logging.info('Client shutting down')
+        sys.exit(0)
 
 
 if __name__ == '__main__':

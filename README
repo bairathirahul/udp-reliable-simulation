@@ -1,8 +1,14 @@
-For Client
-py client.py "filename" port numpyberofpackets
+Team Members:
+    Rahul Bairathi
+    Nipun Gupta
+    Ajinkya Sangvikar
 
-
-For Server
-py server.py port protocol(GBN)
-
-py sever.py port protocol(SR) windowsize
+Steps to start a server:
+•	The current location of Server.py should be opened through command prompt.
+•	To run the PYTHON file: py server.py <filename(GBN or SR)> <port number>
+•	Server gets started and starts waiting for the client on the port provided
+Steps to start a Client:
+•	The current location of Server.py should be opened through command prompt.
+•	To run the PYTHON file: py client.py <filename(GBN or SR)> <port number> <no of packets to send>
+•	Server gets started and starts waiting for the client on the port provided
+NOTE: Please provide the same port as the server port.
